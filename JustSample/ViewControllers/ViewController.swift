@@ -86,7 +86,7 @@ extension ViewController: UIImagePickerControllerDelegate {
                         }
                         resultsText += "\n"
                     }
-                    resultsText += "\n" 
+                    resultsText += "\n"
                 }
                 self.resultsText = resultsText
                 self.resultsLabel.text = self.resultsText

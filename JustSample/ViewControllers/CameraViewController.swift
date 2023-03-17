@@ -6,6 +6,7 @@
 //
 import UIKit
 import AVFoundation
+import MLImage
 import MLKit
 import MLKitTextRecognitionKorean
 
@@ -24,12 +25,16 @@ extension CameraSetupError: LocalizedError {
 
 class CameraViewController: UIViewController {
     
+    private var lastProcessedFrameTimestamp: CMTime = .zero
     private var textRecognizer: TextRecognizer!
     private var previewLayer: AVCaptureVideoPreviewLayer!
     private var captureSession: AVCaptureSession!
     
     var capturedFileURL: URL?
-    
+
+    private var textOverlayView: TextOverlayView!
+
+
     override func viewDidLoad() {
         super.viewDidLoad()
         Task {
@@ -38,6 +43,7 @@ class CameraViewController: UIViewController {
                 setTextRecognizer()
                 setPreview()
                 setPanel()
+                setOverlayView()
             }
         }
     }
@@ -92,6 +98,12 @@ class CameraViewController: UIViewController {
         let options = KoreanTextRecognizerOptions()
         textRecognizer = TextRecognizer.textRecognizer(options: options)
     }
+    
+    func setOverlayView() {
+        textOverlayView = TextOverlayView(frame: view.bounds)
+        view.addSubview(textOverlayView)
+    }
+    
     
     func setupCamera() throws {
         captureSession = AVCaptureSession()
@@ -271,7 +283,7 @@ class CameraViewController: UIViewController {
         let outputFileURL = documentsDirectory.appendingPathComponent("video.mov")
         output.startRecording(to: outputFileURL, recordingDelegate: self)
     }
-
+    
     func imageOrientation(
         deviceOrientation: UIDeviceOrientation,
         cameraPosition: AVCaptureDevice.Position
@@ -342,35 +354,95 @@ extension CameraViewController: AVCapturePhotoCaptureDelegate {
 
 extension CameraViewController: AVCaptureVideoDataOutputSampleBufferDelegate {
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-        guard let pixelBuffer: CVPixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-        let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
-        let context = CIContext(options: nil)
-        guard let cgImage = context.createCGImage(ciImage, from: ciImage.extent) else { return }
-        let uiImage = UIImage(cgImage: cgImage)
-        let visionImage = VisionImage(image: uiImage)
-        
-        // Set the orientation of the VisionImage based on the device orientation
-        let deviceOrientation = UIDevice.current.orientation
-        visionImage.orientation = imageOrientation(deviceOrientation: deviceOrientation, cameraPosition: .back)
-        // Get the size of the image buffer
-        let imageWidth = CVPixelBufferGetWidth(pixelBuffer)
-        let imageHeight = CVPixelBufferGetHeight(pixelBuffer)
-        textRecognizer.process(visionImage) { result, error in
-            guard error == nil, let result = result else {
-                print("Error recognizing text: \(error?.localizedDescription ?? "unknown error")")
-                return
-            }
-            var allLines: [TextLine] = []
-            // Iterate over each block in the result
-            for block in result.blocks {
-                // Get the bounding box of the block and convert it to the coordinate space of the preview layer
-                //print(block.text)
-                allLines.append(contentsOf: block.lines)
-            }
+        let currentFrameTimestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+
+        // Check if the current frame's timestamp is greater than the last processed frame's timestamp
+        if currentFrameTimestamp > lastProcessedFrameTimestamp {
+            // Update the last processed frame's timestamp
+            lastProcessedFrameTimestamp = currentFrameTimestamp
             
-            DispatchQueue.main.async { [weak self] in
-                // Update the UI with the recognized text blocks
+            guard let pixelBuffer: CVPixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+            let visionImage = VisionImage(buffer: sampleBuffer)
+            
+            // Set the orientation of the VisionImage based on the device orientation
+            let orientation = imageOrientation(deviceOrientation: UIDevice.current.orientation, cameraPosition: .back)
+            visionImage.orientation = orientation
+            // Get the size of the image buffer
+            guard let inputImage = MLImage(sampleBuffer: sampleBuffer) else {
+              print("Failed to create MLImage from sample buffer.")
+              return
+            }
+            inputImage.orientation = orientation
+            let imageWidth = CGFloat(CVPixelBufferGetWidth(pixelBuffer))
+            let imageHeight = CGFloat(CVPixelBufferGetHeight(pixelBuffer))
+            recognizeText(in: visionImage, width: imageWidth, height: imageHeight)
+        }
+    }
+    
+    private func recognizeText(in image: VisionImage, width: CGFloat, height: CGFloat) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            do {
+                let recognizedText = try self?.textRecognizer.results(in: image)
+                DispatchQueue.main.async {
+                    for block in recognizedText?.blocks ?? [] {
+                        //if let position = self?.convertedPoints(from: block.cornerPoints, width: width, height: height) {
+                            let newLines = block.lines
+                            self?.updateTextOverlay(lines: newLines)
+                        //}
+                    }
+                }
+            } catch {
+                print("Error recognizing text: \(error)")
             }
         }
     }
+    
+    private func updateTextOverlay(lines: [TextLine]) {
+        // Remove existing text overlays
+        textOverlayView.subviews.forEach { $0.removeFromSuperview() }
+
+        for line in lines {
+                let cornerPoints = line.cornerPoints.map { $0.cgPointValue }
+                let mirroredCornerPoints = mirroredCornerPoints(cornerPoints, containerWidth: previewLayer.bounds.width)
+                guard let topLeft = mirroredCornerPoints?[0],
+                      let bottomRight = mirroredCornerPoints?[2] else {
+                    continue
+                }
+
+                let frame = CGRect(x: topLeft.x, y: topLeft.y, width: bottomRight.x - topLeft.x, height: bottomRight.y - topLeft.y)
+                let label = createLabel(forText: line.text, frame: frame)
+                textOverlayView.addSubview(label)
+        }
+        
+        func createLabel(forText text: String, frame: CGRect) -> UILabel {
+            let label = UILabel()
+            label.text = text
+            label.frame = frame
+            label.textColor = .red // Set the text color
+            label.font = UIFont.boldSystemFont(ofSize: 14) // Set the font size and style
+            label.textAlignment = .center // Set the text alignment
+            label.adjustsFontSizeToFitWidth = true // Adjust the font size to fit the width
+            label.numberOfLines = 0 // Allow multiple lines
+            label.backgroundColor = UIColor(red: 1, green: 1, blue: 1, alpha: 0.3) // Set a semi-transparent background color
+            return label
+        }
+        
+        func mirroredCornerPoints(_ cornerPoints: [CGPoint]?, containerWidth: CGFloat) -> [CGPoint]? {
+            return cornerPoints?.map { point in
+                let mirroredX = containerWidth - point.x
+                return CGPoint(x: mirroredX, y: point.y)
+            }
+        }
+    }
+    
+    private func convertedPoints(from points: [CGPoint]?, width: CGFloat, height: CGFloat) -> [CGPoint]? {
+        return points?.map {
+            let normalizedPoint = CGPoint(x: $0.x / width, y: $0.y / height)
+            let cgPoint = previewLayer.layerPointConverted(fromCaptureDevicePoint: normalizedPoint)
+            return cgPoint
+        }
+    }
+}
+
+class TextOverlayView: UIView {
 }
